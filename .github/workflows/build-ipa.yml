@@ -1,0 +1,60 @@
+name: Generar IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ipa:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Generar proyecto Xcode
+        run: |
+          if ! command -v xcodegen >/dev/null; then
+            brew install xcodegen
+          fi
+          xcodegen generate
+
+      - name: Compilar para iPhone sin firmar
+        shell: bash
+        run: |
+          xcodebuild \
+            -project MySyncAudioTool.xcodeproj \
+            -scheme MySyncAudioTool \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            CONFIGURATION_BUILD_DIR="$RUNNER_TEMP/iphoneos" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Empaquetar IPA
+        shell: bash
+        run: |
+          app="$RUNNER_TEMP/iphoneos/MySyncAudioTool.app"
+          executable=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")
+          test -n "$executable"
+          test -f "$app/$executable"
+          test -x "$app/$executable"
+          package="$(mktemp -d "$RUNNER_TEMP/ipa.XXXXXX")"
+          mkdir "$package/Payload"
+          ditto "$app" "$package/Payload/MySyncAudioTool.app"
+          ditto -c -k --keepParent "$package/Payload" "$RUNNER_TEMP/MySyncAudioTool-unsigned.ipa"
+          unzip -tq "$RUNNER_TEMP/MySyncAudioTool-unsigned.ipa"
+
+      - name: Publicar IPA descargable
+        uses: actions/upload-artifact@v4
+        with:
+          name: MySyncAudioTool-unsigned
+          path: ${{ runner.temp }}/MySyncAudioTool-unsigned.ipa
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

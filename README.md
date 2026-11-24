@@ -2,7 +2,15 @@
 
 App local para dos iPhone con iOS 16 o posterior, pensada para un iPhone X actualizado a iOS 16 y un iPhone 17 Pro. Usa Bluetooth LE para intercambiar órdenes y medir la diferencia entre relojes. No usa Wi‑Fi ni transmite los MP3: cada iPhone reproduce su propia copia por el altavoz integrado.
 
-## Instalar sin App Store
+## Generar el IPA desde Windows con GitHub Actions
+
+1. Sube el proyecto a un repositorio de GitHub con Actions habilitado. El archivo `.github/workflows/build-ipa.yml` debe estar en la rama predeterminada para que aparezca el botón de ejecución.
+2. Si quieres incluir música, añade tus MP3 a `songs/` **antes de subir el código**. Git los ignora por defecto: usa `git add -f` para añadir explícitamente los archivos que quieras incluir. Si no añades ninguno, el IPA solo incluye la prueba de sincronización. Los MP3 incluidos se distribuyen dentro del IPA; usa un repositorio privado y solo archivos que tengas permiso de subir.
+3. En GitHub abre **Actions → Generar IPA → Run workflow**, elige la rama con tus cambios y pulsa **Run workflow**.
+4. Cuando termine la ejecución, abre su resumen y descarga **MySyncAudioTool-unsigned** en **Artifacts**. GitHub entrega un ZIP: extráelo para obtener `MySyncAudioTool-unsigned.ipa`. El artefacto caduca a los 14 días.
+5. El IPA **no está firmado** y no se puede instalar directamente desde Archivos, Mail o OneDrive. Fírmalo e instálalo en ambos iPhone desde Windows con una herramienta como Sideloadly. GitHub Actions no necesita tu cuenta de Apple para compilar.
+
+## Instalar desde un Mac sin App Store
 
 1. En un Mac con un Xcode compatible con el iOS instalado en el iPhone 17 Pro, instala XcodeGen (`brew install xcodegen` si usas Homebrew).
 2. Copia tus MP3 directamente a `songs/` con nombres como `01-tema.mp3` y `02-tema.mp3`. El orden es alfabético por nombre de archivo completo; usa el mismo número de dígitos en todos los prefijos. También puedes dejar la carpeta vacía y probar solo la sincronización.
