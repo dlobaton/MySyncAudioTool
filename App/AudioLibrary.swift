@@ -13,7 +13,7 @@ struct AudioLibrary {
             songs = try FileManager.default.contentsOfDirectory(at: directory,
                 includingPropertiesForKeys: [.isRegularFileKey], options: .skipsHiddenFiles)
                 .filter {
-                    guard $0.pathExtension.lowercased() == "mp3" else { return false }
+                    guard ["mp3", "wav"].contains($0.pathExtension.lowercased()) else { return false }
                     return try $0.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true
                 }
                 .sorted { $0.lastPathComponent.utf8.lexicographicallyPrecedes($1.lastPathComponent.utf8) }
@@ -21,7 +21,7 @@ struct AudioLibrary {
             songs = []
         }
         var playlist = SHA256()
-        playlist.update(data: Data("MySyncAudioTool/1".utf8))
+        playlist.update(data: Data("MySyncAudioTool/2".utf8))
         for url in songs {
             var file = SHA256()
             let handle = try FileHandle(forReadingFrom: url)

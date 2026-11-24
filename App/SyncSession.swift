@@ -14,6 +14,9 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
         var start: Int64?
         var deadline: Int64
         var armed = false
+        var mediaOffset = 0.0
+        var replacesCurrent = false
+        var countdownStart = false
 
         init(token: UInt64, index: Int, player: AVAudioPlayer, deadline: Int64) {
             self.token = token
@@ -22,7 +25,20 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
             self.deadline = deadline
         }
 
-        var end: Int64? { start.map { $0 + Monotonic.ns(player.duration) } }
+        var end: Int64? {
+            start.map { $0 + Monotonic.ns(max(0, player.duration - mediaOffset)) }
+        }
+    }
+
+    private struct PendingControl {
+        enum Kind: UInt8 {
+            case pause = 1, resume
+        }
+
+        let token: UInt64
+        let kind: Kind
+        let time: Int64
+        var acknowledged: Bool
     }
 
     @Published private(set) var stage: Stage = .loading
@@ -31,6 +47,9 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
     @Published private(set) var role: Role?
     @Published private(set) var correction = 0
     @Published private(set) var acousticOK = false
+    @Published private(set) var isPaused = false
+    @Published private(set) var currentTrackIndex: Int?
+    @Published private(set) var countdownSeconds: Int?
 
     private let audio = AVAudioSession.sharedInstance()
     private var library: AudioLibrary?
@@ -52,6 +71,14 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private var current: Cue?
     private var retiring: [Cue] = []
     private var target: Int64 = 0
+    private var pendingControl: PendingControl?
+    private var controlSequence: UInt64 = 0
+    private var remoteOutputVolume: Float?
+    private var matchedTargetVolume: Float?
+    private var appliedGain: Float = 1
+    private var lastVolumeReport: Int64 = 0
+    private var lastGainReport: Int64 = 0
+    private var reportedOutputVolume: Float = -1
 
     override init() {
         super.init()
@@ -80,6 +107,10 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     var canConnect: Bool { library != nil && link == nil }
     var isConnected: Bool { link != nil }
+    var canControlMusic: Bool {
+        role == .host && acousticOK && queued == nil && pendingControl == nil &&
+            (stage == .verified || stage == .playing)
+    }
 
     func connect(_ role: Role) {
         guard canConnect else { return }
@@ -155,7 +186,32 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     func play() {
         guard role == .host, acousticOK, stage == .verified, !titles.isEmpty else { return }
-        begin(index: 0, earliest: Monotonic.now + Monotonic.ns(2.5))
+        begin(index: 0, earliest: Monotonic.now + Monotonic.ns(30), countdownStart: true)
+    }
+
+    func playTrack(_ index: Int) {
+        guard canControlMusic, titles.indices.contains(index) else { return }
+        begin(index: index, earliest: Monotonic.now + Monotonic.ns(2.5), manualSelection: true)
+    }
+
+    func togglePlayback() {
+        guard role == .host, stage == .playing, current.map({ $0.index >= 0 }) == true,
+              queued == nil, pendingControl == nil else { return }
+        let kind: PendingControl.Kind = isPaused ? .resume : .pause
+        controlSequence += 1
+        let time = Monotonic.now + Monotonic.ns(1.5)
+        if kind == .resume, let cue = current {
+            cue.mediaOffset = cue.player.currentTime
+            cue.player.currentTime = cue.mediaOffset
+            guard schedule(cue, at: time) else {
+                fail("No se pudo programar la reanudación sincronizada.")
+                return
+            }
+        }
+        pendingControl = PendingControl(token: controlSequence, kind: kind, time: time,
+                                        acknowledged: false)
+        link?.send(Packet(kind == .pause ? .pause : .resume,
+                          controlSequence, UInt64(time)))
     }
 
     private var usingSpeaker: Bool {
@@ -184,7 +240,7 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
-        fail("No se pudo decodificar el audio. \(error?.localizedDescription ?? "Revisa el archivo MP3.")")
+        fail("No se pudo decodificar el audio. \(error?.localizedDescription ?? "Revisa el archivo de la canción.")")
     }
 
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
@@ -198,7 +254,7 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     private func showVerified() {
         show(.verified, titles.isEmpty
-             ? "Pulsos confirmados. Añade MP3 a songs y reinstala la misma app en ambos iPhone."
+             ? "Pulsos confirmados. Añade archivos MP3 o WAV a songs y reinstala la misma app en ambos iPhone."
              : role == .host ? "Pulsos confirmados. Ya puedes reproducir la lista."
                              : "Pulsos confirmados. El anfitrión iniciará la reproducción.")
     }
@@ -240,6 +296,17 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
         nextPing = 0
         ping = nil
         sequence = 0
+        pendingControl = nil
+        controlSequence = 0
+        remoteOutputVolume = nil
+        matchedTargetVolume = nil
+        appliedGain = 1
+        isPaused = false
+        currentTrackIndex = nil
+        countdownSeconds = nil
+        lastVolumeReport = 0
+        lastGainReport = 0
+        reportedOutputVolume = -1
     }
 
     private func didConnect() {
@@ -263,7 +330,7 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
         case .hello:
             guard connected, !handshake, let library = library else { return }
             guard packet.a == library.fingerprint.0, packet.b == library.fingerprint.1 else {
-                fail("Las listas no coinciden. Instala la misma versión con los mismos MP3 en ambos iPhone.")
+                fail("Las listas no coinciden. Instala la misma versión con los mismos archivos de audio en ambos iPhone.")
                 return
             }
             handshake = true
@@ -277,6 +344,11 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
         case (.host?, .ping):
             lastPeer = now
             link?.send(Packet(.pong, packet.a, UInt64(Monotonic.now)))
+        case (.host?, .volume):
+            let volume = Float(bitPattern: UInt32(truncatingIfNeeded: packet.a))
+            guard volume.isFinite, (0...1).contains(volume) else { return }
+            remoteOutputVolume = volume
+            updateMatchedGain(sendToGuest: true)
         case (.guest?, .pong):
             guard let sent = ping, packet.a == UInt64(sent),
                   let remote = Int64(exactly: packet.b) else { return }
@@ -288,7 +360,7 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
             if stage == .measuring {
                 show(.linked, "Relojes alineados. Coloca los iPhone a igual distancia de ti y lanza la prueba.")
             }
-        case (.guest?, .prepare):
+        case (.guest?, .prepare), (.guest?, .select), (.guest?, .playlist):
             prepareGuest(packet)
         case (.host?, .ready):
             armHost(packet)
@@ -302,6 +374,20 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 }
                 cue.armed = true
             }
+        case (.guest?, .pause):
+            scheduleControl(packet, kind: .pause)
+        case (.guest?, .resume):
+            scheduleControl(packet, kind: .resume)
+        case (.host?, .controlReady):
+            guard var action = pendingControl,
+                  packet.a == action.token, packet.b == UInt64(action.kind.rawValue) else { return }
+            action.acknowledged = true
+            pendingControl = action
+        case (.guest?, .gain):
+            let targetVolume = Float(bitPattern: UInt32(truncatingIfNeeded: packet.a))
+            guard targetVolume.isFinite, (0...1).contains(targetVolume) else { return }
+            matchedTargetVolume = targetVolume
+            applyGain(gain(for: targetVolume, outputVolume: audio.outputVolume))
         case (.guest?, .verified):
             guard stage == .listening || (stage == .testing && current?.index == -1) else { return }
             acousticOK = true
@@ -319,11 +405,13 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
             player = try AVAudioPlayer(contentsOf: library.songs[index])
         }
         guard player.duration.isFinite, player.duration > 0, player.prepareToPlay() else { return nil }
+        player.volume = appliedGain
         player.delegate = self
         return Cue(token: token, index: index, player: player, deadline: deadline)
     }
 
-    private func begin(index: Int, earliest: Int64) {
+    private func begin(index: Int, earliest: Int64, manualSelection: Bool = false,
+                       countdownStart: Bool = false) {
         let now = Monotonic.now
         guard now - lastClockReady < Monotonic.ns(1.6) else {
             fail("La medición del reloj ya no es estable. Acerca los iPhone y vuelve a intentarlo.")
@@ -337,10 +425,14 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 fail("No se pudo preparar el audio seleccionado.")
                 return
             }
+            cue.replacesCurrent = manualSelection
+            cue.countdownStart = countdownStart
             queued = cue
             target = start
-            statusForQueue(index)
-            link?.send(Packet(.prepare, cue.token, UInt64(index + 1)))
+            if countdownStart { countdownSeconds = 30 }
+            statusForQueue(index, countdownStart: countdownStart)
+            let kind: Packet.Kind = manualSelection ? .select : countdownStart ? .playlist : .prepare
+            link?.send(Packet(kind, cue.token, UInt64(index + 1)))
         } catch {
             fail("No se pudo abrir el audio: \(error.localizedDescription)")
         }
@@ -353,8 +445,18 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
             return
         }
         let index = value - 1
-        let expected = index == -1 ? [.linked, .listening, .verified].contains(stage)
-                                   : acousticOK && index == (current.map { $0.index + 1 } ?? 0)
+        let expected: Bool
+        switch packet.kind {
+        case .playlist:
+            expected = index == 0 && acousticOK && stage == .verified
+        case .select:
+            expected = index >= 0 && acousticOK &&
+                (stage == .verified || stage == .playing)
+        default:
+            expected = index == -1
+                ? [.linked, .listening, .verified].contains(stage)
+                : acousticOK && index == (current.map { $0.index + 1 } ?? 0)
+        }
         guard expected else {
             fail("Los iPhone no están en el mismo punto de la lista.")
             return
@@ -368,17 +470,22 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
             }
             sequence = packet.a
             queued = cue
+            cue.replacesCurrent = packet.kind == .select
+            cue.countdownStart = packet.kind == .playlist
+            if cue.countdownStart { countdownSeconds = 30 }
             if index == -1 { acousticOK = false }
-            statusForQueue(index)
+            statusForQueue(index, countdownStart: cue.countdownStart)
             link?.send(Packet(.ready, cue.token))
         } catch {
             fail("No se pudo abrir el audio: \(error.localizedDescription)")
         }
     }
 
-    private func statusForQueue(_ index: Int) {
+    private func statusForQueue(_ index: Int, countdownStart: Bool = false) {
         if index == -1 {
             show(.testing, "Escucha tres pulsos. Si cada uno se oye como un solo golpe, están alineados.")
+        } else if countdownStart {
+            show(.playing, "La lista comienza en 30 segundos. Mantén ambos iPhone cerca y la app abierta.")
         } else if current == nil {
             show(.playing, "Programando \(titles[index]) en ambos iPhone…")
         }
@@ -404,11 +511,12 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
         let (start, overflow) = hostTime.subtractingReportingOverflow(offset)
         let now = Monotonic.now
-        guard !overflow, start >= now + Monotonic.ns(0.35), start <= now + Monotonic.ns(8),
+        guard !overflow, start >= now + Monotonic.ns(0.35), start <= now + Monotonic.ns(35),
               schedule(cue, at: start) else {
             fail("El invitado no pudo programar la pista a tiempo.")
             return
         }
+        target = start
         cue.armed = true
         link?.send(Packet(.armed, cue.token))
     }
@@ -422,6 +530,61 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
         guard delay >= 0.3, deviceTime > 0, cue.player.play(atTime: deviceTime + delay) else { return false }
         cue.start = start
         return true
+    }
+
+    private func scheduleControl(_ packet: Packet, kind: PendingControl.Kind) {
+        guard pendingControl == nil, current.map({ $0.index >= 0 }) == true,
+              queued == nil, packet.a > 0,
+              let hostTime = Int64(exactly: packet.b),
+              let offset = clock.offset(at: Monotonic.now) else {
+            fail("No se pudo preparar el control sincronizado de reproducción.")
+            return
+        }
+        let (time, overflow) = hostTime.subtractingReportingOverflow(offset)
+        let now = Monotonic.now
+        guard !overflow, time >= now + Monotonic.ns(0.35),
+              time <= now + Monotonic.ns(3) else {
+            fail("El control de reproducción llegó demasiado tarde.")
+            return
+        }
+        if kind == .resume, let cue = current {
+            cue.mediaOffset = cue.player.currentTime
+            cue.player.currentTime = cue.mediaOffset
+            guard schedule(cue, at: time) else {
+                fail("No se pudo programar la reanudación sincronizada.")
+                return
+            }
+        }
+        pendingControl = PendingControl(token: packet.a, kind: kind, time: time,
+                                        acknowledged: true)
+        link?.send(Packet(.controlReady, packet.a, UInt64(kind.rawValue)))
+    }
+
+    private func applyGain(_ gain: Float) {
+        let adjustedGain = max(0, min(1, gain))
+        guard abs(adjustedGain - appliedGain) > 0.001 else { return }
+        appliedGain = adjustedGain
+        for cue in [queued, current].compactMap({ $0 }) + retiring {
+            cue.player.volume = appliedGain
+        }
+    }
+
+    private func updateMatchedGain(sendToGuest: Bool) {
+        guard role == .host else { return }
+        let localVolume = audio.outputVolume
+        let targetVolume = min(localVolume, remoteOutputVolume ?? localVolume)
+        matchedTargetVolume = targetVolume
+        applyGain(gain(for: targetVolume, outputVolume: localVolume))
+        let now = Monotonic.now
+        if sendToGuest || now >= lastGainReport {
+            link?.send(Packet(.gain, UInt64(targetVolume.bitPattern)))
+            lastGainReport = now + Monotonic.ns(2)
+        }
+    }
+
+    private func gain(for target: Float, outputVolume: Float) -> Float {
+        if outputVolume > 0.001 { return max(0, min(1, target / outputVolume)) }
+        return target <= 0.001 ? 0 : 1
     }
 
     private func tick() {
@@ -448,6 +611,41 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
                     show(.linked, "Relojes alineados. Espera a que el anfitrión lance la prueba.")
                 }
             }
+            let volume = audio.outputVolume
+            let volumeChanged = abs(volume - reportedOutputVolume) > 0.01
+            if volumeChanged, let targetVolume = matchedTargetVolume {
+                applyGain(gain(for: targetVolume, outputVolume: volume))
+            }
+            if now - lastVolumeReport >= Monotonic.ns(1) || volumeChanged {
+                link?.send(Packet(.volume, UInt64(volume.bitPattern)))
+                reportedOutputVolume = volume
+                lastVolumeReport = now
+            }
+        } else {
+            let volume = audio.outputVolume
+            let volumeChanged = abs(volume - reportedOutputVolume) > 0.01
+            if volumeChanged { reportedOutputVolume = volume }
+            updateMatchedGain(sendToGuest: volumeChanged || now >= lastGainReport)
+        }
+
+        if let action = pendingControl {
+            if !action.acknowledged && now >= action.time - Monotonic.ns(0.2) {
+                fail("El otro iPhone no confirmó el control de reproducción.")
+                return
+            }
+            if action.acknowledged && now >= action.time {
+                if action.kind == .pause, let cue = current {
+                    cue.player.pause()
+                    cue.mediaOffset = cue.player.currentTime
+                    cue.start = nil
+                    isPaused = true
+                    show(.playing, "Pausada: \(titles[cue.index]). Pulsa Reanudar para continuar.")
+                } else if action.kind == .resume, let cue = current {
+                    isPaused = false
+                    show(.playing, "Sonando: \(titles[cue.index])")
+                }
+                pendingControl = nil
+            }
         }
 
         if let cue = queued {
@@ -456,14 +654,29 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 return
             }
             if cue.armed, let start = cue.start, now >= start {
-                if let previous = current { retiring.append(previous) }
+                if let previous = current {
+                    if cue.replacesCurrent {
+                        previous.player.delegate = nil
+                        previous.player.stop()
+                    } else {
+                        retiring.append(previous)
+                    }
+                }
                 current = cue
                 queued = nil
+                isPaused = false
+                countdownSeconds = nil
+                currentTrackIndex = cue.index >= 0 ? cue.index : nil
                 if cue.index >= 0 { show(.playing, "Sonando: \(titles[cue.index])") }
             }
         }
+        if let cue = queued, cue.countdownStart, let start = cue.start {
+            let seconds = max(0, Int(ceil(Monotonic.seconds(start - now))))
+            if countdownSeconds != seconds { countdownSeconds = seconds }
+        }
         retiring.removeAll { now >= ($0.end ?? now) + Monotonic.ns(0.3) }
         guard let cue = current, let end = cue.end, queued == nil else { return }
+        guard !isPaused, pendingControl == nil else { return }
         let completion = end + (role == .host ? Monotonic.ns(0.25) : 0)
         if cue.index == -1 {
             if now >= completion {
@@ -486,6 +699,7 @@ final class SyncSession: NSObject, ObservableObject, AVAudioPlayerDelegate {
         } else if now >= completion {
             current = nil
             retiring.append(cue)
+            currentTrackIndex = nil
             showVerified()
         }
     }

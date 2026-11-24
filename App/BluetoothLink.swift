@@ -6,6 +6,7 @@ enum Role: Equatable { case host, guest }
 struct Packet {
     enum Kind: UInt8 {
         case hello = 1, ping, pong, clockReady, prepare, ready, arm, armed, stop, fault, verified
+        case select, playlist, pause, resume, controlReady, volume, gain
     }
 
     let kind: Kind
