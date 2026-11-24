@@ -1,0 +1,27 @@
+name: MySyncAudioTool
+options:
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  MySyncAudioTool:
+    type: application
+    platform: iOS
+    info:
+      path: AppInfo.plist
+      properties:
+        CFBundleDisplayName: Al Unísono
+        NSBluetoothAlwaysUsageDescription: Bluetooth conecta los dos iPhone y coordina cuándo debe sonar el audio.
+        UILaunchScreen: {}
+    sources:
+      - App
+      - path: songs
+        type: folder
+        buildPhase: resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.mysyncaudiotool.app
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES

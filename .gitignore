@@ -1,0 +1,6 @@
+MySyncAudioTool.xcodeproj/
+AppInfo.plist
+DerivedData/
+.DS_Store
+songs/*
+!songs/.gitkeep
